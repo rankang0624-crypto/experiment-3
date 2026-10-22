@@ -13,15 +13,41 @@
 
 <img width="504" height="640" alt="image" src="https://github.com/user-attachments/assets/4428a461-0d2d-4164-97ea-551391690c59" />
 
+    import cv2
+    import numpy as np
+ 
+    a = cv2.imread("a.jpg")
+    b = cv2.imread("b.jpg")
+ 
+    if a is None or b is None:
+    raise FileNotFoundError("请将 a.jpg、b.jpg 放在脚本同目录")
 三、实验原理与实现
 1. SIFT 特征提取
 SIFT（尺度不变特征变换）能够在不同尺度和一定旋转、光照变化下提取具有区分性的局部特征。程序调用 cv2.SIFT_create()，分别计算两张图像的关键点和描述符。关键点数量可用于描述检测到的局部特征规模，但数量多并不必然意味着拼接质量更好。
 本次检测结果：图像 A 提取 4,959 个关键点，图像 B 提取 3,558 个关键点。
-2. FLANN 特征匹配与 Lowe 比率测试
+
+       sift = cv2.SIFT_create()
+ 
+       gray_a = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
+       gray_b = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
+ 
+       ka, da = sift.detectAndCompute(gray_a, None)
+       kb, db = sift.detectAndCompute(gray_b, None)
+ 
+       print("图像 A 关键点数量：", len(ka))
+       print("图像 B 关键点数量：", len(kb))
+ 
+       cv2.imwrite("03_keypoints_a.jpg",
+            cv2.drawKeypoints(a, ka, None))
+       cv2.imwrite("04_keypoints_b.jpg",
+            cv2.drawKeypoints(b, kb, None))
+3. FLANN 特征匹配与 Lowe 比率测试
 使用 FLANN 近似最近邻匹配器，对图像 B 的描述符在图像 A 的描述符集合中进行 KNN 查询（k=2）。对最近邻距离 d1 和次近邻距离 d2，保留满足 d1 < 0.7 × d2 的匹配，以降低局部描述子相似但实际位置不对应的错误匹配。
 本次共进行 3,558 组 KNN 查询，筛选得到 1,113 对优质匹配点。
 <img width="744" height="351" alt="image" src="https://github.com/user-attachments/assets/574be593-abc5-4fdd-aabc-0df2a4dd8f5a" />
+
 图 3  FLANN 与 Lowe 比率测试后的匹配结果
+
 # FLANN 的 KD-Tree 参数适用于 SIFT 浮点型描述符
     flann = cv2.FlannBasedMatcher(
     dict(algorithm=1, trees=5),
@@ -47,26 +73,139 @@ SIFT（尺度不变特征变换）能够在不同尺度和一定旋转、光照�
     cv2.imwrite("01_sift_flann_matches.jpg", match_img)
 
 
-图 3  FLANN 与 Lowe 比率测试后的匹配结果
 3. RANSAC 与单应矩阵估计
 由于初始匹配仍可能包含误匹配，实验使用 RANSAC 对候选匹配进行几何一致性检验。程序以图像 B 的关键点作为源点、图像 A 的关键点作为目标点，调用 cv2.findHomography(..., cv2.RANSAC, 4.0) 估计单应矩阵，并将投影误差小于设定阈值的匹配作为内点。
 本次得到 1,086 个 RANSAC 内点，内点比例为 97.57%（1,086 / 1,113）。这表明筛选后的匹配点具有较强的几何一致性。
+<img width="744" height="351" alt="image" src="https://github.com/user-attachments/assets/c8f7e80b-3172-4203-be82-a19517e0926a" />
 
 图 4  RANSAC 几何内点匹配结果
+
+    if len(good) < 4:
+    raise RuntimeError("优质匹配点不足，无法估计单应矩阵")
+ 
+    # 从图像 B 的匹配点映射到图像 A
+    src_pts = np.float32(
+    [kb[m.queryIdx].pt for m in good]
+    ).reshape(-1, 1, 2)
+    dst_pts = np.float32(
+    [ka[m.trainIdx].pt for m in good]
+    ).reshape(-1, 1, 2)
+ 
+    H, mask = cv2.findHomography(
+    src_pts, dst_pts, cv2.RANSAC, 4.0
+    )
+    if H is None:
+     raise RuntimeError("RANSAC 单应矩阵估计失败")
+ 
+    inliers = int(mask.sum())
+    inlier_ratio = inliers / len(good)
+    print("RANSAC 内点数量：", inliers)
+    print("RANSAC 内点比例：{:.2%}".format(inlier_ratio))
+ 
+    inlier_matches = [
+    m for m, ok in zip(good, mask.ravel()) if ok
+    ]
+    inlier_img = cv2.drawMatches(
+    b, kb, a, ka, inlier_matches, None,
+    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+    )
+    cv2.imwrite("02_ransac_inliers.jpg", inlier_img)
 4. 图像配准与融合策略
 根据估计的单应矩阵，将图像 B 投影到图像 A 的坐标系，并根据变换后两张图像的边界计算拼接画布。随后比较以下融合策略：
 noBlending：不对重叠区域进行权重混合，直接覆盖像素，方法简单，但边界可能明显。
 linearBlending：对重叠区域使用固定的 50% / 50% 权重进行线性融合，可减弱接缝，但可能出现重影或模糊。
 linearBlendingWithConstant：依据到图像边界的距离计算融合权重，使边界附近的权重变化更平滑。该实现是对报告所述固定宽度融合思想的近似复现，并非原仓库中省略函数的逐行复刻。
+<img width="744" height="559" alt="image" src="https://github.com/user-attachments/assets/482d3865-59fb-4918-902d-4944fa777445" />
 
+        ha, wa = a.shape[:2]
+        hb, wb = b.shape[:2]
+ 
+        corners_b = np.float32([
+       [0, 0], [0, hb], [wb, hb], [wb, 0]
+       ]).reshape(-1, 1, 2)
+ 
+       warped_corners = cv2.perspectiveTransform(corners_b, H)
+       corners_a = np.float32([
+       [0, 0], [0, ha], [wa, ha], [wa, 0]
+       ]).reshape(-1, 1, 2)
+ 
+       all_corners = np.concatenate([warped_corners, corners_a])
+       xmin, ymin = np.floor(
+       all_corners.min(axis=0).ravel()
+       ).astype(int)
+       xmax, ymax = np.ceil(
+       all_corners.max(axis=0).ravel()
+       ).astype(int)
+ 
+       W, Hh = xmax - xmin, ymax - ymin
+       T = np.array([
+       [1, 0, -xmin],
+       [0, 1, -ymin],
+       [0, 0, 1]
+       ], dtype=np.float64)
+ 
+       warped_b = cv2.warpPerspective(b, T @ H, (W, Hh))
+       warped_a = np.zeros_like(warped_b)
+       mask_a = np.zeros((Hh, W), dtype=np.uint8)
+ 
+       x0, y0 = -xmin, -ymin
+       warped_a[y0:y0+ha, x0:x0+wa] = a
+       mask_a[y0:y0+ha, x0:x0+wa] = 255
+ 
+       mask_b = cv2.warpPerspective(
+       np.ones((hb, wb), dtype=np.uint8) * 255,
+       T @ H, (W, Hh)
 图 5  noBlending 无融合结果
 
+<img width="744" height="559" alt="image" src="https://github.com/user-attachments/assets/64052062-467c-41ca-ad14-0bdb10165d1d" />
+
+# 直接将图像 A 覆盖到变换后的图像 B 上
+    out = warped_b.copy()
+    out[mask_a > 0] = warped_a[mask_a > 0]
+    cv2.imwrite("05_noBlending.jpg", out)
 图 6  linearBlending 线性融合结果
 
+<img width="744" height="559" alt="image" src="https://github.com/user-attachments/assets/7eec6699-7512-4370-8524-f454b9d8c2aa" />
+
+    out = warped_b.copy()
+    only_a = (mask_a > 0) & (mask_b == 0)
+    overlap = (mask_a > 0) & (mask_b > 0)
+ 
+    out[only_a] = warped_a[only_a]
+# 重叠区域两幅图像各占 50% 权重
+    out[overlap] = cv2.addWeighted(
+    warped_a[overlap].reshape(-1, 1, 3), 0.5,
+    warped_b[overlap].reshape(-1, 1, 3), 0.5,
+    0
+    ).reshape(-1, 3)
+ 
+    cv2.imwrite("06_linearBlending.jpg", out)
+    
 图 7  linearBlendingWithConstant 平滑融合结果
 5. OpenCV Stitcher API
 为了进行实现方式对比，实验调用 cv2.Stitcher_create(cv2.Stitcher_PANORAMA).stitch([a, b]) 运行 OpenCV 自动拼接流程。本次返回状态码 0（Stitcher_OK），表示 API 成功完成拼接。
 
+<img width="744" height="559" alt="image" src="https://github.com/user-attachments/assets/58d8760f-aba5-4520-9697-24f7b8fb898c" />
+
+     dist_a = cv2.distanceTransform(
+    (mask_a > 0).astype(np.uint8), cv2.DIST_L2, 3
+    )
+    dist_b = cv2.distanceTransform(
+    (mask_b > 0).astype(np.uint8), cv2.DIST_L2, 3
+    )
+ 
+    alpha = (dist_a / (dist_a + dist_b + 1e-6))[..., None]
+    out = (
+    warped_a.astype(np.float32) * alpha
+    + warped_b.astype(np.float32) * (1 - alpha)
+    ).clip(0, 255).astype(np.uint8)
+ 
+    only_a = (mask_a > 0) & (mask_b == 0)
+    only_b = (mask_b > 0) & (mask_a == 0)
+    out[only_a] = warped_a[only_a]
+    out[only_b] = warped_b[only_b]
+ 
+    cv2.imwrite("07_linearBlendingWithConstant.jpg", out)
 图 8  OpenCV Stitcher 自动拼接结果
 四、实验结果与分析
 实验指标	实际结果
